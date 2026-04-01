@@ -1,0 +1,156 @@
+const express = require("express");
+const app = express();
+const http = require("http").createServer(app);
+const io = require("socket.io")(http);
+
+app.use(express.static("public"));
+
+let rooms = {};
+let players = {};
+
+function deck(){
+  const suits=["♠","♥","♦","♣"];
+  const values=["2","3","4","5","6","7","8","9","10","J","Q","K","A"];
+  let d=[];
+  suits.forEach(s=>values.forEach(v=>d.push(v+s)));
+  return shuffle(d);
+}
+
+function shuffle(d){
+  for(let i=d.length-1;i>0;i--){
+    let j=Math.floor(Math.random()*(i+1));
+    [d[i],d[j]]=[d[j],d[i]];
+  }
+  return d;
+}
+
+function getValue(v){
+  if(v==="A") return 14;
+  if(v==="K") return 13;
+  if(v==="Q") return 12;
+  if(v==="J") return 11;
+  return parseInt(v);
+}
+
+function evaluate(cards){
+  let vals=cards.map(c=>getValue(c.slice(0,-1))).sort((a,b)=>a-b);
+  let suits=cards.map(c=>c.slice(-1));
+
+  let counts={};
+  vals.forEach(v=>counts[v]=(counts[v]||0)+1);
+
+  let isFlush = suits.every(s=>s===suits[0]);
+  let isStraight = vals.every((v,i)=> i===0 || v===vals[i-1]+1);
+
+  let freq = Object.values(counts).sort((a,b)=>b-a);
+
+  if(isStraight && isFlush) return 9;
+  if(freq[0]===4) return 8;
+  if(freq[0]===3 && freq[1]===2) return 7;
+  if(isFlush) return 6;
+  if(isStraight) return 5;
+  if(freq[0]===3) return 4;
+  if(freq[0]===2 && freq[1]===2) return 3;
+  if(freq[0]===2) return 2;
+  return 1;
+}
+
+io.on("connection", socket=>{
+
+  players[socket.id]={chips:15000};
+
+  socket.on("createRoom", ()=>{
+    let code=Math.random().toString(36).substring(2,7);
+
+    rooms[code]={
+      players:[socket.id],
+      deck:deck(),
+      hands:{},
+      community:[],
+      pot:0
+    };
+
+    socket.join(code);
+    socket.emit("room",code);
+  });
+
+  socket.on("joinRoom", code=>{
+    let room=rooms[code];
+    if(room){
+      room.players.push(socket.id);
+      socket.join(code);
+      socket.emit("room",code);
+
+      if(room.players.length===2) startGame(code);
+    }
+  });
+
+  function startGame(code){
+    let room=rooms[code];
+    room.deck=deck();
+    room.community=[];
+    room.pot=0;
+
+    room.players.forEach(id=>{
+      room.hands[id]=[room.deck.pop(),room.deck.pop()];
+      io.to(id).emit("hand",room.hands[id]);
+    });
+
+    if(room.players.length===1){
+      room.hands["AI"]=[room.deck.pop(),room.deck.pop()];
+    }
+
+    room.community=[room.deck.pop(),room.deck.pop(),room.deck.pop()];
+    io.to(code).emit("community",room.community);
+  }
+
+  socket.on("bet",({code,amount})=>{
+    let room=rooms[code];
+    if(players[socket.id].chips>=amount){
+      players[socket.id].chips-=amount;
+      room.pot+=amount;
+      io.to(code).emit("pot",room.pot);
+    }
+  });
+
+  socket.on("next",code=>{
+    let room=rooms[code];
+
+    if(room.community.length===3){
+      room.community.push(room.deck.pop());
+    } else if(room.community.length===4){
+      room.community.push(room.deck.pop());
+    }
+
+    io.to(code).emit("community",room.community);
+  });
+
+  socket.on("reveal",code=>{
+    let room=rooms[code];
+
+    let best=0;
+    let winner=null;
+
+    let list=[...room.players];
+    if(room.hands["AI"]) list.push("AI");
+
+    list.forEach(id=>{
+      let cards=room.hands[id].concat(room.community);
+      let rank=evaluate(cards);
+
+      if(rank>best){
+        best=rank;
+        winner=id;
+      }
+    });
+
+    if(winner!=="AI"){
+      players[winner].chips+=room.pot;
+    }
+
+    io.to(code).emit("winner",{winner: winner==="AI"?"AI":"Player", pot:room.pot});
+  });
+
+});
+
+http.listen(process.env.PORT||3000);
